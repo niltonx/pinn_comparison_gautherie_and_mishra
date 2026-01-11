@@ -1,0 +1,436 @@
+"""
+PINN 3D para Bio-Transferência de Calor de Pennes em Geometria Combinada
+(Semiesfera + Cilindro).
+
+Equação: ∇ · (k ∇T) + wb*rhob*cb * (Ta - T) + Q = 0
+
+Modelo utiliza propriedades termofísicas distintas para o tecido glandular (mama) e o tumor.
+A geometria agora é:
+1. Semiesfera (R=9cm) para z >= 0
+2. Cilindro (R=9cm, H=1.27cm) para z em [-1.27cm, 0]
+A face Dirichlet é em z = -1.27cm.
+"""
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from mpl_toolkits.mplot3d import Axes3D # Importação padrão, mas não usada na visualização 2D final
+
+# --- 1. CONFIGURAÇÃO E PARÂMETROS ---
+torch.manual_seed(42)
+np.random.seed(42)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando dispositivo: {device}")
+
+# --- Parâmetros Geométricos (em metros) ---
+R_SEMI = 0.09 		# Raio da semiesfera e do cilindro (9 cm)
+H_CYLINDER = 0.0127 	# Altura do cilindro (1.27 cm)
+R_TUMOR = 0.0115 	# Raio do tumor (1.15 cm)
+Z_TUMOR = 0.06 		# Profundidade do centro do tumor (6 cm, a partir da interface z=0)
+
+# O domínio Z total é [-H_CYLINDER, R_SEMI]
+
+# --- Parâmetros de Contorno e Ambientais ---
+T_base = 37.0 		# Temperatura prescrita na Face Posterior (Dirichlet, z = -H_CYLINDER)
+h_conv = 5.0 		# Coeficiente de convecção (W/m²·K)
+T_inf = 21.0 		# Temperatura ambiente (°C)
+Ta = 37.0 			# Temperatura arterial (°C)
+
+# --- Parâmetros Termofísicos (iguais ao código original) ---
+RHO_B = 1060.0 		# Densidade do sangue (kg/m³)
+C_B = 4200.0 		# Calor específico do sangue (J/kg·°C)
+RHO_B_C_B = RHO_B * C_B
+
+# Mama Glandular (Região 1)
+K_MAMA = 0.48
+W_B_MAMA = 0.00018
+Q_M_MAMA = 450.0
+OMEGA_MAMA = W_B_MAMA * RHO_B_C_B
+Q_TOTAL_MAMA = Q_M_MAMA
+
+# Tumor Maligno (Região 2)
+K_TUMOR = 0.48
+W_B_TUMOR = 0.009
+Q_TOTAL_TUMOR = 7426.68
+OMEGA_TUMOR = W_B_TUMOR * RHO_B_C_B
+
+# --- Hiperparâmetros de Treino ---
+lr = 1e-4
+epochs_adam = 80000
+epochs_lbfgs = 10000
+w_bc = 5000.0 		# Peso das Condições de Contorno
+n_pde = 10000 		# Pontos na PDE
+n_bc = 4000 		# Pontos na Fronteira
+
+print("--- Configuração do Modelo 3D com Geometria Semiesfera + Cilindro ---")
+print(f"Domínio Z: [{-H_CYLINDER*100:.2f} cm, {R_SEMI*100:.1f} cm]")
+print(f"Centro do Tumor (Z): {Z_TUMOR*100:.1f} cm")
+print(f"Mama (k, ω, Q): ({K_MAMA}, {OMEGA_MAMA:.1f}, {Q_TOTAL_MAMA})")
+print(f"Tumor (k, ω, Q): ({K_TUMOR}, {OMEGA_TUMOR:.1f}, {Q_TOTAL_TUMOR})")
+
+# --- 2. ARQUITETURA DA REDE ---
+class MLP3D(nn.Module):
+	# Rede Neural com 3 entradas (x, y, z)
+	def __init__(self, neurons=128, layers=6):
+		super(MLP3D, self).__init__()
+		layers_list = [nn.Linear(3, neurons), nn.Tanh()]
+		for _ in range(layers - 1):
+			layers_list += [nn.Linear(neurons, neurons), nn.Tanh()]
+		layers_list += [nn.Linear(neurons, 1)]
+		self.net = nn.Sequential(*layers_list)
+
+	# Normalização dos inputs
+	def forward(self, x, y, z):
+		# Normaliza usando o raio máximo R_SEMI, que é a maior dimensão X, Y, Z.
+		x_norm = x / R_SEMI
+		y_norm = y / R_SEMI
+		z_norm = z / R_SEMI
+		return self.net(torch.cat([x_norm, y_norm, z_norm], dim=1))
+
+model = MLP3D().to(device)
+
+# --- 3. GERAÇÃO DE PONTOS (3D) ---
+def generate_pde_points(num_points):
+	"""Gera pontos aleatórios no domínio englobante e filtra para a geometria combinada."""
+	# Bounding Box: x, y in [-R, R], z in [-H_CYLINDER, R_SEMI]
+
+	# Gerando tensores de forma (N, 1)
+	x = torch.rand(num_points, 1, device=device) * 2 * R_SEMI - R_SEMI
+	y = torch.rand(num_points, 1, device=device) * 2 * R_SEMI - R_SEMI
+
+	# Z vai de -H_CYLINDER até R_SEMI
+	z = torch.rand(num_points, 1, device=device) * (R_SEMI + H_CYLINDER) - H_CYLINDER
+
+	r_xy_sq = x**2 + y**2
+	inside_cylinder_base = (r_xy_sq <= R_SEMI**2) # Máscara para pontos dentro da base circular
+
+	# Critério 1: Cilindro (z < 0) - Pontos devem estar dentro da base E na faixa z
+	mask_cylinder = (z < 0) & (z >= -H_CYLINDER) & inside_cylinder_base
+
+	# Critério 2: Semiesfera (z >= 0) - Pontos devem estar dentro da esfera
+	r_sphere_sq = x**2 + y**2 + z**2
+	mask_hemisphere = (z >= 0) & (r_sphere_sq <= R_SEMI**2)
+
+	# A máscara final é a união dos dois critérios
+	inside_mask = mask_cylinder | mask_hemisphere
+
+	# Aplica a máscara e usa .view(-1, 1) para garantir a forma (N_filtered, 1)
+	x_pde = x[inside_mask].view(-1, 1).requires_grad_(True)
+	y_pde = y[inside_mask].view(-1, 1).requires_grad_(True)
+	z_pde = z[inside_mask].view(-1, 1).requires_grad_(True)
+
+	return x_pde, y_pde, z_pde
+
+def generate_bc_points(num_points):
+	"""Gera pontos na base (Dirichlet) e nas superfícies convectivas (Robin)."""
+	# 1. Base Posterior (Dirichlet: z = -H_CYLINDER, x² + y² <= R_SEMI²)
+	r_base = torch.rand(num_points, 1, device=device) * R_SEMI
+	theta_base = torch.rand(num_points, 1, device=device) * 2 * np.pi
+	x_dirichlet = (r_base * torch.cos(theta_base)).requires_grad_(True)
+	y_dirichlet = (r_base * torch.sin(theta_base)).requires_grad_(True)
+	z_dirichlet = torch.full_like(x_dirichlet, -H_CYLINDER).requires_grad_(True)
+
+	# --- Pontos Robin (Soma da Superfície Esférica + Lateral Cilíndrica) ---
+	num_robin_sphere = num_points // 2
+	num_robin_cyl = num_points - num_robin_sphere
+
+	# 2. Superfície Esférica (Robin 1: x² + y² + z² = R_SEMI², z >= 0)
+	phi_rs = torch.rand(num_robin_sphere, 1, device=device) * np.pi / 2 # Polar [0, pi/2]
+	theta_rs = torch.rand(num_robin_sphere, 1, device=device) * 2 * np.pi # Azimuthal [0, 2pi]
+
+	x_rs = (R_SEMI * torch.sin(phi_rs) * torch.cos(theta_rs)).requires_grad_(True)
+	y_rs = (R_SEMI * torch.sin(phi_rs) * torch.sin(theta_rs)).requires_grad_(True)
+	z_rs = (R_SEMI * torch.cos(phi_rs)).requires_grad_(True)
+
+	# 3. Superfície Lateral do Cilindro (Robin 2: x² + y² = R_SEMI², z in [-H_CYLINDER, 0])
+	theta_rc = torch.rand(num_robin_cyl, 1, device=device) * 2 * np.pi
+	# z em [-H_CYLINDER, 0]
+	z_rc = torch.rand(num_robin_cyl, 1, device=device) * H_CYLINDER - H_CYLINDER
+
+	x_rc = (R_SEMI * torch.cos(theta_rc)).requires_grad_(True)
+	y_rc = (R_SEMI * torch.sin(theta_rc)).requires_grad_(True)
+
+	# Combina todos os pontos Robin
+	x_robin = torch.cat([x_rs, x_rc])
+	y_robin = torch.cat([y_rs, y_rc])
+	z_robin = torch.cat([z_rs, z_rc])
+
+	return (x_dirichlet, y_dirichlet, z_dirichlet), (x_robin, y_robin, z_robin)
+
+# --- 4. FUNÇÕES DE PROPRIEDADES (K, OMEGA, Q) ---
+def get_tissue_mask(x, y, z):
+	"""Retorna uma máscara booleana: True para tumor, False para mama."""
+	# O centro do tumor está em (0, 0, Z_TUMOR)
+	r_tumor_sq = x**2 + y**2 + (z - Z_TUMOR)**2
+	inside_tumor = (r_tumor_sq <= R_TUMOR**2)
+	return inside_tumor
+
+def get_conductivity(x, y, z, mask):
+	"""Retorna a condutividade térmica k para cada ponto."""
+	return mask * K_TUMOR + (~mask) * K_MAMA
+
+def get_perfusion_coefficient(mask):
+	"""Retorna o coeficiente de perfusão volumétrica ω."""
+	return mask * OMEGA_TUMOR + (~mask) * OMEGA_MAMA
+
+def get_heat_generation(mask):
+	"""Retorna Q para cada ponto (x,y,z)."""
+	return mask * Q_TOTAL_TUMOR + (~mask) * Q_TOTAL_MAMA
+
+# --- 5. CÁLCULO DA PERDA ---
+def compute_loss(model, points_pde, points_dirichlet, points_robin):
+
+	# 1. Perda da PDE (Pennes 3D): ∇ · (k ∇T) + ω * (Ta - T) + Q = 0
+	x_pde, y_pde, z_pde = points_pde
+	T = model(x_pde, y_pde, z_pde)
+
+	# Máscara de Tecido
+	mask_tumor = get_tissue_mask(x_pde, y_pde, z_pde)
+
+	# Propriedades
+	# k_field precisa de requires_grad_(True)
+	k_field = get_conductivity(x_pde, y_pde, z_pde, mask_tumor).requires_grad_(True)
+	omega_field = get_perfusion_coefficient(mask_tumor)
+	Q_field = get_heat_generation(mask_tumor)
+
+	# Derivadas de primeira ordem (dT/dx, dT/dy, dT/dz)
+	grad_T = torch.autograd.grad(T.sum(), [x_pde, y_pde, z_pde], create_graph=True)
+	dT_dx, dT_dy, dT_dz = grad_T[0], grad_T[1], grad_T[2]
+
+	# Termo de Condução (∇ · (k ∇T))
+	k_dT_dx = k_field * dT_dx
+	k_dT_dy = k_field * dT_dy
+	k_dT_dz = k_field * dT_dz
+
+	# Derivadas de segunda ordem (Termo de Condução Completo)
+	div_k_grad_T = (
+		torch.autograd.grad(k_dT_dx.sum(), x_pde, create_graph=True)[0] +
+		torch.autograd.grad(k_dT_dy.sum(), y_pde, create_graph=True)[0] +
+		torch.autograd.grad(k_dT_dz.sum(), z_pde, create_graph=True)[0]
+	)
+
+	# Residual da Equação de Pennes
+	residual_pennes = div_k_grad_T + omega_field * (Ta - T) + Q_field
+	loss_pde = torch.mean(residual_pennes**2)
+
+	# 2. Perda das Fronteiras (BCs)
+
+	# --- BC LADO BASE (z = -H_CYLINDER): DIRICHLET (T = T_base) ---
+	T_dirichlet_pred = model(*points_dirichlet)
+	loss_bc_dir = torch.mean((T_dirichlet_pred - T_base)**2)
+
+	# --- BC SUPERFÍCIES ROBIN (Convecção) ---
+	# Condição: -k_mama * (dT/dn) = h * (T - T_inf)
+
+	x_r, y_r, z_r = points_robin
+	T_robin = model(x_r, y_r, z_r)
+
+	# Re-calculando gradientes na fronteira Robin
+	grad_T_r = torch.autograd.grad(T_robin.sum(), [x_r, y_r, z_r], create_graph=True)
+	dT_dx_r, dT_dy_r, dT_dz_r = grad_T_r[0], grad_T_r[1], grad_T_r[2]
+
+	# Classificação dos pontos Robin: z >= 0 (Esfera) vs z < 0 (Cilindro Lateral)
+	mask_sphere = z_r >= 0
+
+	# Inicializa dT_dn (Derivada Normal)
+	dT_dn = torch.zeros_like(x_r)
+
+	# 1. Esfera (z >= 0): Normal n = (x/R, y/R, z/R)
+	x_s, y_s, z_s = x_r[mask_sphere], y_r[mask_sphere], z_r[mask_sphere]
+	dT_dx_s, dT_dy_s, dT_dz_s = dT_dx_r[mask_sphere], dT_dy_r[mask_sphere], dT_dz_r[mask_sphere]
+	dT_dn[mask_sphere] = (dT_dx_s * x_s / R_SEMI) + (dT_dy_s * y_s / R_SEMI) + (dT_dz_s * z_s / R_SEMI)
+
+	# 2. Cilindro Lateral (z < 0): Normal n = (x/R, y/R, 0)
+	x_c, y_c = x_r[~mask_sphere], y_r[~mask_sphere]
+	dT_dx_c, dT_dy_c = dT_dx_r[~mask_sphere], dT_dy_r[~mask_sphere]
+	# dT/dn = (dT/dx * x/R) + (dT/dy * y/R)
+	dT_dn[~mask_sphere] = (dT_dx_c * x_c / R_SEMI) + (dT_dy_c * y_c / R_SEMI)
+
+	# Residual de Robin: -k_mama * dT/dn - h * (T - T_inf) = 0
+	# Usamos K_MAMA como k do tecido na fronteira
+	residual_robin = (-K_MAMA * dT_dn) - h_conv * (T_robin - T_inf)
+	loss_bc_robin = torch.mean(residual_robin**2)
+
+	# Perda Total Ponderada
+	loss_bc_total = loss_bc_dir + loss_bc_robin
+	return loss_pde + w_bc * loss_bc_total
+
+# --- 6. TREINO ---
+# Inicializa os pontos de treino
+points_pde = generate_pde_points(n_pde * 2)
+points_dirichlet, points_robin = generate_bc_points(n_bc)
+
+optimizer_adam = torch.optim.Adam(model.parameters(), lr=lr)
+
+print("\n--- Fase 1: Adam ---")
+start_time = time.time()
+for epoch in range(epochs_adam):
+	optimizer_adam.zero_grad()
+	# Adiciona a re-amostragem dos pontos PDE periodicamente
+	if epoch > 0 and epoch % 5000 == 0:
+		points_pde = generate_pde_points(n_pde * 2)
+		points_dirichlet, points_robin = generate_bc_points(n_bc)
+
+	loss = compute_loss(model, points_pde, points_dirichlet, points_robin)
+	loss.backward()
+	optimizer_adam.step()
+	if epoch % 5000 == 0:
+		print(f"Época {epoch}: Loss {loss.item():.5f}")
+
+print("\n--- Fase 2: L-BFGS ---")
+optimizer_lbfgs = torch.optim.LBFGS(model.parameters(), max_iter=epochs_lbfgs, line_search_fn="strong_wolfe")
+def closure():
+	optimizer_lbfgs.zero_grad()
+	# Re-amostra pontos antes da closure do L-BFGS
+	global points_pde, points_dirichlet, points_robin
+	points_pde = generate_pde_points(n_pde * 2)
+	points_dirichlet, points_robin = generate_bc_points(n_bc)
+
+	loss = compute_loss(model, points_pde, points_dirichlet, points_robin)
+	loss.backward()
+	return loss
+optimizer_lbfgs.step(closure)
+print(f"Treino concluído em {time.time() - start_time:.1f}s")
+
+
+# --- 7. VISUALIZAÇÃO (Corte no Plano Y=0) ---
+model.eval()
+res = 100
+# Cria a malha para o corte no plano Y=0 (eixo XZ)
+x_slice = np.linspace(-R_SEMI, R_SEMI, res)
+# Z vai de -H_CYLINDER até R_SEMI
+z_slice = np.linspace(-H_CYLINDER, R_SEMI, res)
+X, Z = np.meshgrid(x_slice, z_slice)
+
+x_flat = torch.tensor(X.flatten(), dtype=torch.float32, device=device).view(-1, 1)
+y_flat = torch.full_like(x_flat, 0.0) # Y = 0 (plano de corte)
+z_flat = torch.tensor(Z.flatten(), dtype=torch.float32, device=device).view(-1, 1)
+
+# Filtra pontos que estão DENTRO da geometria para visualização
+r_xy_sq_flat = x_flat**2 + y_flat**2
+r_sphere_sq_flat = x_flat**2 + y_flat**2 + z_flat**2
+
+# Critério 1: Cilindro (z < 0)
+mask_cylinder_flat = (z_flat < 0) & (z_flat >= -H_CYLINDER) & (r_xy_sq_flat <= R_SEMI**2)
+
+# Critério 2: Semiesfera (z >= 0)
+mask_hemisphere_flat = (z_flat >= 0) & (r_sphere_sq_flat <= R_SEMI**2)
+
+inside_mask_flat = (mask_cylinder_flat | mask_hemisphere_flat).cpu().numpy().flatten()
+outside_mask_flat = ~inside_mask_flat
+
+with torch.no_grad():
+	T_pred_flat = model(x_flat, y_flat, z_flat).cpu().numpy().flatten()
+
+# Mascara os pontos fora da geometria
+T_masked = T_pred_flat.copy()
+T_masked[outside_mask_flat] = np.nan # Define como NaN para não plotar
+T_pred_slice = T_masked.reshape(res, res)
+
+# --- Plotagem 2D ---
+fig, ax = plt.subplots(figsize=(10, 8))
+
+# 2D Heatmap no corte XZ (Y=0)
+c = ax.contourf(X*100, Z*100, T_pred_slice, levels=100, cmap='inferno')
+plt.colorbar(c, ax=ax, label='Temp (°C)')
+
+# --- Desenha os limites da nova geometria ---
+
+# 1. Limite Curvo da Semiesfera (Robin)
+t_arc_semi = np.linspace(-R_SEMI, R_SEMI, 100)
+z_hemisphere = np.sqrt(R_SEMI**2 - t_arc_semi**2) # z >= 0
+# Plota apenas o arco de 0 a R
+mask_plot_hemi = z_hemisphere >= 0
+ax.plot(t_arc_semi[mask_plot_hemi]*100, z_hemisphere[mask_plot_hemi]*100, 'w--', linewidth=2, label='Superfície Esférica (Robin)')
+
+# 2. Limite Inferior (Dirichlet)
+ax.axhline(-H_CYLINDER*100, color='cyan', linestyle='-', linewidth=2, label='Base Cilindro (Dirichlet)')
+
+# 3. Limites Laterais do Cilindro (Robin)
+# Linhas verticais em x = R_SEMI e x = -R_SEMI para z in [-H_CYLINDER, 0]
+ax.plot([R_SEMI*100, R_SEMI*100], [-H_CYLINDER*100, 0], 'w--', linewidth=2, label='Lateral Cilindrica (Robin)')
+ax.plot([-R_SEMI*100, -R_SEMI*100], [-H_CYLINDER*100, 0], 'w--', linewidth=2)
+
+# 4. Interface (z=0)
+ax.axhline(0, color='gray', linestyle=':', linewidth=1, label='Interface z=0')
+
+# Desenha o tumor (corte Y=0)
+# Centro: (0, Z_TUMOR)
+tumor_circle = plt.Circle((0, Z_TUMOR*100), R_TUMOR*100, color='lime', fill=False, linestyle='-', linewidth=2)
+ax.add_patch(tumor_circle)
+ax.text(0, Z_TUMOR*100, 'Tumor', color='lime', ha='center', va='center', fontsize=10, weight='bold')
+
+ax.set_title(f'Perfil de Temperatura 2D (Corte Y=0) em Geometria Combinada\n(ω_mama={OMEGA_MAMA:.1f}, ω_tumor={OMEGA_TUMOR:.1f})')
+ax.set_xlabel('X (cm)')
+ax.set_ylabel('Z (cm)')
+ax.set_aspect('equal')
+ax.set_facecolor('black')
+# Ajusta a legenda para evitar duplicidade de labels se a label foi usada em 2 plots
+handles, labels = ax.get_legend_handles_labels()
+unique_labels = dict(zip(labels, handles))
+ax.legend(unique_labels.values(), unique_labels.keys(), loc='lower left', framealpha=0.3, labelcolor='white')
+
+# --- 8. VISUALIZAÇÃO: Perfil de Temperatura no Eixo Central X=0, Y=0 (NOVO) ---
+print("\n--- Plotando Perfil T vs Z (X=0, Y=0) ---")
+num_points_z = 200
+
+# Define o intervalo de interesse (2 cm a 9 cm)
+z_profile_start_cm = 2.0
+z_profile_end_cm = R_SEMI * 100 # 9.0 cm (Limite do domínio)
+z_profile_cm = np.linspace(z_profile_start_cm, z_profile_end_cm, num_points_z)
+z_profile = z_profile_cm / 100.0 # Converte de volta para metros para o modelo
+
+# Coordenadas: X=0, Y=0 (eixo central)
+x_prof = torch.full((num_points_z, 1), 0.0, dtype=torch.float32, device=device)
+y_prof = torch.full((num_points_z, 1), 0.0, dtype=torch.float32, device=device)
+z_prof = torch.tensor(z_profile, dtype=torch.float32, device=device).view(-1, 1)
+
+with torch.no_grad():
+    T_profile_pred = model(x_prof, y_prof, z_prof).cpu().numpy().flatten()
+
+# =========================================================================
+# COMANDO PARA IMPRIMIR OS DADOS DA CURVA Z vs T (2cm a 9cm)
+# =========================================================================
+print("\n--- Tabela de Coordenadas Z e Temperaturas (Eixo Central) ---")
+print(f"Intervalo: {z_profile_start_cm:.1f} cm a {z_profile_end_cm:.1f} cm ({num_points_z} pontos)")
+print("----------------------------------------------------------------")
+print("{:<10} {:<15}".format("Z (cm)", "T (°C)"))
+print("----------------------------------------------------------------")
+
+# Combina Z e T em um array e imprime
+data_table = np.column_stack((z_profile_cm, T_profile_pred))
+for z, t in data_table:
+    # Imprime com 4 casas decimais para precisão
+    print("{:<10.4f} {:<15.4f}".format(z, t))
+
+print("----------------------------------------------------------------")
+
+
+# Plotagem do Perfil Z
+fig_z, ax_z = plt.subplots(figsize=(8, 6))
+
+# T no Eixo Y e Z no Eixo X
+ax_z.plot(z_profile_cm, T_profile_pred, 'r-', linewidth=2, label='Temperatura (T)')
+ax_z.scatter(z_profile_cm[0], T_profile_pred[0], color='blue', marker='o', label=f'Profundidade Mínima Z={z_profile_start_cm:.0f}cm')
+ax_z.scatter(z_profile_cm[-1], T_profile_pred[-1], color='red', marker='o', label=f'Superfície Z={z_profile_end_cm:.0f}cm')
+
+
+# Marcações do Tumor (em Z)
+tumor_top = (Z_TUMOR + R_TUMOR) * 100
+tumor_bottom = (Z_TUMOR - R_TUMOR) * 100
+tumor_center = Z_TUMOR * 100
+
+# Linhas de referência verticais para o tumor
+ax_z.axvspan(tumor_bottom, tumor_top, color='lime', alpha=0.1, label='Região do Tumor')
+ax_z.axvline(tumor_center, color='lime', linestyle='-', linewidth=2, label=f'Centro do Tumor (Z={tumor_center:.2f} cm)')
+
+
+ax_z.set_title(f'Perfil de Temperatura vs. Profundidade Z (Eixo Central X=0, Y=0)\n(ω_tumor={OMEGA_TUMOR:.1f}, Q_tumor={Q_TOTAL_TUMOR})')
+ax_z.set_xlabel('Profundidade Z (cm)') # Z no Eixo X
+ax_z.set_ylabel('Temperatura (°C)') # T no Eixo Y
+ax_z.grid(True, linestyle=':', alpha=0.6)
+ax_z.legend(loc='upper right')
+
+plt.show()
